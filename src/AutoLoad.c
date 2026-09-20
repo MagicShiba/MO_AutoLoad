@@ -13,6 +13,12 @@
  *       NoManualUnload=yes 的载具 (清道夫 TRACTOR 等) 不可被进入, 仅作为运输方
  *       被跳过 —— 它本身仍可作为乘客进入 LCRF/SAPC 等正常运输载具; 容量与装载
  *       等级按引擎原生判据 (Size 之和 / SizeLimit) 严格记账; 支持 载具->运输载具。
+ *       分波放行: 分配一次算完。先走后进 (HANDBOOK §10): 首波最近者直接拿
+ *       Enter (空槽直链, 第一个上), 其余先 Move 行军到载具附近 (Move 不进链,
+ *       多人并行不抢槽), 载具每上一个人 (occ 上涨) 下一个才转 Enter —— 同一时刻
+ *       最多一个未上车的 Enter 持有者, 槽交接无竞争, 上车顺序=距离序, 总耗时≈
+ *       最远行军+ N×轮询。现任死亡/任务丢失/超时 300 帧无进展则越过。
+ *       Stagger=0 回到 legacy 行为 (同帧全下发, 顺序随机)。
  *
  * 功能2 变体选择: IFV逻辑载具 (FV/AMC/TRACTOR/STING 等 Gunner=yes) 随载员不同
  *       使用 Weapon1/Weapon2/... 中的不同实际武器, 但原生T键按注册名全选会把
@@ -23,7 +29,7 @@
  *       Techno Array), 与原生T键的单/双击语义对齐。选择是纯本地UI状态
  *       (调 Select, 不发网络事件), 与T键一致, 联机安全。
  *       实现注意: 武器指针必须经引擎 accessor 0x7177C0 解析 (Ares 接管了
- *       18+ 槽位存储), 不得直接按 type+0x898+idx*0x1C 计算 (见 §17.3)。
+ *       18+ 槽位存储), 不得直接按 type+0x898+idx*0x1C 计算 (见 HANDBOOK §3)。
  *
  * 热键: 游戏目录旁的 AutoLoad.ini ([AutoLoad] Hotkey=Ctrl+D,
  *       VariantHotkey=Ctrl+T), 支持 Ctrl/Alt/Shift/Win 组合 与
@@ -34,16 +40,20 @@
  *       (真实点击路径 0x4D76C6: ClickedMission(7, NULL, 载具, NULL) =>
  *        Whom=步兵, Mission=7, Target={0,0}空, Destination=TC(载具对象)),
  *       走 OutList 正常网络管线广播, 所有机器按帧执行, 不引入任何自定义事件/状态。
+ *       分波放行同样安全: session 状态是按下者本机静态内存 (别机无 session 不跟进),
+ *       间隔是固定帧数 (不用随机数), 校验读的是同步的 Techno Array, 下发仍是
+ *       标准广播命令 —— 等价于玩家分几次手动点选, 锁步模型下天然同步。红线:
+ *       不写单位/载具模拟内存, 不用非同步 RNG/墙钟做模拟决策, 本 DLL 均不碰。
  *
  * 日志: 游戏目录 AutoLoad.log (仅带日志版; nolog 版无任何文件 I/O)。
- * 结构/地址依据见 AutoLoadDev/notes/NOTES.md。
+ * 结构/地址依据见 AutoLoadDev/notes/HANDBOOK.md。
  */
 
 #include <windows.h>
 #include <stdarg.h>
 
 /* 无 CRT (-nostdlib): 数组搬移/清零习语会被 GCC 优化成 memcpy/memset
- * 调用而导致链接期缺符号 (v2.5 的插入排序移位即触发)。自带字节实现兜底;
+ * 调用而导致链接期缺符号 。自带字节实现兜底;
  * 构建再加 -ffreestanding 让 GCC 不再主动生成此类库调用。 */
 static void* AL_memcpy(void* d, const void* s, unsigned n)
 {
@@ -110,7 +120,7 @@ void* memset(void* s, int c, unsigned n)
  * Ares hook 了武器加载 (0x7128C0)、GetWeapon/GetEliteWeapon (0x7177C0/
  * 0x7177E0)、SwitchGunner (0x70DC70)、ReceiveGunner (0x74642C),
  * 18+ 槽位存放在 Ares 自有存储里。直接计算在 idx>=18 时读到 elite 残留/0/邻域
- * (STNK 4种武器变出7组、AMC 大量不同武器坍成一组的病根, v2.1)。必须调被 hook
+ * (STNK 4种武器变出7组、AMC 大量不同武器坍成一组的病根)。必须调被 hook
  * 的 0x7177C0 accessor 解析 (它同时只给普通Weapon, 精英单位也不返回Elite,
  * 正好符合“忽略EliteWeapon”的需求)。类型ID字符串在 type+0x24
  * (0x410A40: add ecx,0x24 后 _stricmp 确认, 仅用于日志)。 */
@@ -130,10 +140,20 @@ void* memset(void* s, int c, unsigned n)
 #define ADDR_HOOK_FRAME          0x0055D360u /* 每帧函数入口 (Phobos FrameStep_Begin 同款) */
 
 #define MISSION_ENTER   7
+#define MISSION_MOVE    2   /* 行军 (先走后进, Destination=格子TC) */
+#define RTTI_CELL       11  /* TargetClass RTTI: 格子 (ID = X+1000*Y, 见 YRpp TargetClass.h) */
 #define MAX_PASSENGERS  128
 #define MAX_TRANSPORTS  64
 #define MAX_EVENTS_PER_FRAME 96
 #define RANGE_LEPTONS   (30 * 256)  /* "附近"半径: 30 格 (与任一选中乘客的平面距离) */
+
+/* Session watchdog: a normal session ends in dozens of frames;
+ * SESS_MAX_FRAMES is a pure backstop. Boarding latency itself comes
+ * from the engine (Mission_Enter polls every 14-16 frames, HANDBOOK). */
+#define SESS_MAX_FRAMES 900
+/* Stall timeout: a released Enter holder making no progress (dead,
+ * mission lost, or carrier driven away) is skipped after N frames. */
+#define STALL_MAX_FRAMES 300
 
 /* ---------------- 内嵌 Syringe 钩子声明 (单文件, 无需 .dll.inj) ----------------
  * PE 段名必须恰好是 ".syhks00" —— 8 字节精确匹配 (参考无 .inj 的 dll 实测),
@@ -288,8 +308,12 @@ static unsigned int  g_vVkKey = 'T';
 static unsigned int  g_vMods = HKMOD_CONTROL;
 static int           g_vDisabled = 0;
 static char          g_vDesc[24] = "Ctrl+T";
+/* Stagger=1 (default): plan once, release waves gated on boarding. */
+/* Stagger=0: legacy single-frame dispatch (boarding order random). */
+static int           g_stagger = 1;
 
 static int ChrLower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
 
 static int StrEqNI(const char* a, const char* b)
 {
@@ -454,6 +478,9 @@ static void ReadConfig(void)
     ParseVariantHotkey(buf);
     LogParts("config: variant hotkey = ", g_vDesc,
              " (from AutoLoad.ini [AutoLoad] VariantHotkey)", NULL);
+    GetPrivateProfileStringA("AutoLoad", "Stagger", "1", buf, sizeof(buf), path);
+    g_stagger = (buf[0] == '0' && buf[1] == 0) ? 0 : 1;
+    LOG2("config: stagger = ", g_stagger ? "1" : "0 (legacy dispatch)");
 }
 
 /* ---------------- 键盘轮询线程 ---------------- */
@@ -566,7 +593,7 @@ static void* g_asgTrn[MAX_TRANSPORTS];
 static int   g_asgCnt[MAX_TRANSPORTS];
 static int   g_asgCount = 0;
 
-/* 本轮 pass 内 (组, 载具) 的同类型已分配数 (v2.6 均匀主键):
+/* 本轮 pass 内 (组, 载具) 的同类型已分配数 (均匀主键):
  * 选车只看"车上总人数"时, 跨轮次后距离会把同类又吸回同一辆车
  * (5反+5光+10守争5×4座 → 某要塞进2反)。以"车上同类型人数"为第一主键,
  * 每个成员永远先去"还没有同类的车", 小类型被强制铺开 (上例必得 1+1+2)。
@@ -587,6 +614,217 @@ static void EndPass(void)
     g_passActive = 0;
     g_doneCount = 0;
     g_asgCount = 0;
+}
+
+/* ---- Staggered sessions (Stagger=1) ----
+ * Plan once into g_plan*; release per-carrier lanes: the nearest takes
+ * Enter immediately, the rest march (Move, no link) and convert to
+ * Enter one by one as occupancy rises. Every pointer is revalidated
+ * against the Techno Array before use, so dead/destroyed/reloaded
+ * units drop out and the session heals itself. Session state lives
+ * on the presser's machine only: network-safe. */
+
+/* 规划结果 (DoAutoLoad(forPlan=1) 填写, 发车道消费) */
+static void* g_planPax[MAX_PASSENGERS];
+static void* g_planTrn[MAX_PASSENGERS];
+static int   g_planDist[MAX_PASSENGERS]; /* 距离>>8 (格), 单调, 排序键 */
+static int   g_planSame[MAX_PASSENGERS]; /* 下发后车上同类数 (日志 tSame 用) */
+static int   g_planCount = 0;
+static int   g_planGrp[MAX_PASSENGERS]; /* group index per plan entry */
+
+/* 车道: 一车一车道 (lane[0] 拿 Enter 先行, 其余先 Move 行军,
+ * occ 上涨 (有人上车) 才逐个转 Enter —— 同一时刻最多一个未上车的 Enter
+ * 持有者, 槽交接无竞争, 顺序=车道顺序=距离序) */
+static void* g_laneTrn[MAX_TRANSPORTS];
+static void* g_lanePax[MAX_TRANSPORTS][MAX_PASSENGERS];
+static int   g_laneDist[MAX_TRANSPORTS][MAX_PASSENGERS];
+static int   g_laneSame[MAX_TRANSPORTS][MAX_PASSENGERS];
+static int   g_laneN[MAX_TRANSPORTS];
+static int   g_laneNext[MAX_TRANSPORTS]; /* 下一个转 Enter 的下标 */
+static int   g_laneMoveNext[MAX_TRANSPORTS]; /* 下一个待发 Move 的下标 */
+static int   g_laneGate[MAX_TRANSPORTS];     /* 现任 Enter 下发时的 occ */
+static int   g_laneStall[MAX_TRANSPORTS];    /* 现任无进展帧数 */
+static void* g_laneActive[MAX_TRANSPORTS];   /* 现任 (最后下发 Enter 者) */
+static int   g_nlanes = 0;
+
+static int   g_sessActive = 0;
+static int   g_sessFrame = 0;   /* session 内帧计数 (hook 每帧+1, 确定性) */
+static int   g_sessReleased = 0;
+
+/* Released units (Enter dispatched): skipped on replan, Enters kept. */
+/* Fresh sessions clear the set; dead/gone entries pruned each tick. */
+static void* g_relObjs[MAX_PASSENGERS];
+static int   g_relCount = 0;
+
+
+
+
+
+/* 对象是否还在全局 Techno 数组里 (存活且未被删档): 纯指针比较, 不解引用 */
+static int ObjAliveInTechnoArray(const void* obj)
+{
+    void** items = *(void***)OFF_TECHNO_ITEMS;
+    int count = *(int*)OFF_TECHNO_COUNT;
+    int i;
+    if (!obj || !items || count <= 0 || count > 100000)
+        return 0;
+    for (i = 0; i < count; i++)
+        if (items[i] == obj) return 1;
+    return 0;
+}
+
+static int IsReleased(const void* obj)
+{
+    int i;
+    for (i = 0; i < g_relCount; i++)
+        if (g_relObjs[i] == obj) return 1;
+    return 0;
+}
+
+static void MarkReleased(const void* obj)
+{
+    if (!IsReleased(obj) && g_relCount < MAX_PASSENGERS)
+        g_relObjs[g_relCount++] = (void*)obj;
+}
+
+/* 从 released 名单除名 (任务丢失后重新规划用) */
+static void UnmarkReleased(const void* obj)
+{
+    int i;
+    for (i = 0; i < g_relCount; i++)
+    {
+        if (g_relObjs[i] == obj)
+        {
+            int j;
+            for (j = i + 1; j < g_relCount; j++)
+                g_relObjs[j - 1] = g_relObjs[j];
+            g_relCount--;
+            return;
+        }
+    }
+}
+
+/* A released unit still holding its Enter (+0xAC = mission, 7 = Enter)?
+ * A user Stop / manual redirect / engine-cleared mission voids the old Enter,
+ * so such units must be unmarked and replanned (else skipped forever). */
+static int ReleasedHoldsEnter(const void* obj)
+{
+    if (!ObjAliveInTechnoArray((void*)obj))
+        return 0;
+    return (*(int*)((char*)obj + 0xAC) == 7);
+}
+
+/* Drop dead/gone entries (boarding does NOT remove array entries). */
+static void PruneReleased(void)
+{
+    int i, w = 0;
+    for (i = 0; i < g_relCount; i++)
+    {
+        if (ObjAliveInTechnoArray(g_relObjs[i]))
+            g_relObjs[w++] = g_relObjs[i];
+    }
+    g_relCount = w;
+}
+
+/* 引擎 PassengersClass::GetTotalSize 的前向声明 (定义在后, 诊断快照先用) */
+static int GetUsedSlots(void* trn);
+
+/* Intra-group proximity swap: keep the spread COUNTS from step 5
+ * (evenness first: 1+4 stays 1+4), but move members onto the carrier
+ * standing next to them. Kills "position swap" runs (both sides lined up
+ * yet A-side units sent to B and vice versa).
+ * Greedy: repeatedly take the shortest (member, carrier) pair whose
+ * carrier still has group quota left. Same group => same cost, so per
+ * carrier totals never change: capacity/SizeLimit conclusions unaffected.
+ * Deterministic (fixed scan order, strict < for min): all peers agree.
+ * Planning mode only (Stagger=0 keeps legacy behavior). */
+static void ReassignProximity(void)
+{
+    int done[MAX_PASSENGERS];
+    int e, moved = 0;
+    char b1[16];
+    for (e = 0; e < g_planCount; e++) done[e] = 0;
+    for (e = 0; e < g_planCount; e++)
+    {
+        int g, f, ent[MAX_PASSENGERS], ne = 0;
+        void* qc[MAX_TRANSPORTS];
+        int qleft[MAX_TRANSPORTS], nq = 0;
+        int asg[MAX_PASSENGERS], i2, c2, remaining;
+        if (done[e])
+            continue;
+        g = g_planGrp[e];
+        /* collect group members + quotas (quota = step-5 counts) */
+        for (f = 0; f < g_planCount; f++)
+        {
+            int c, found = -1;
+            if (g_planGrp[f] != g)
+                continue;
+            done[f] = 1;
+            ent[ne++] = f;
+            for (c = 0; c < nq; c++)
+                if (qc[c] == g_planTrn[f]) { found = c; break; }
+            if (found < 0) { qc[nq] = g_planTrn[f]; qleft[nq] = 1; nq++; }
+            else qleft[found]++;
+        }
+        if (nq < 2)
+            continue; /* single carrier: nothing to swap */
+        for (i2 = 0; i2 < ne; i2++) asg[i2] = -1;
+        remaining = ne;
+        while (remaining > 0)
+        {
+            long long bestD = (long long)0x7FFFFFFFFFFFFFFFLL;
+            int bi = -1, bc = -1;
+            for (i2 = 0; i2 < ne; i2++)
+            {
+                if (asg[i2] >= 0)
+                    continue;
+                for (c2 = 0; c2 < nq; c2++)
+                {
+                    long long dd;
+                    if (qleft[c2] <= 0)
+                        continue;
+                    dd = Dist2Leptons(g_planPax[ent[i2]], qc[c2]);
+                    if (dd < bestD) { bestD = dd; bi = i2; bc = c2; }
+                }
+            }
+            if (bi < 0)
+                break; /* unreachable: quotas sum == members */
+            asg[bi] = bc;
+            qleft[bc]--;
+            remaining--;
+            if (g_planTrn[ent[bi]] != qc[bc])
+            {
+                g_planTrn[ent[bi]] = qc[bc];
+                moved++;
+            }
+            g_planDist[ent[bi]] = (int)(bestD >> 8);
+        }
+    }
+    /* renumber per-(group,carrier) same-type counts in plan order
+     * (identical values when nothing moved) */
+    for (e = 0; e < g_planCount; e++)
+    {
+        int cnt = 0, f;
+        for (f = 0; f < e; f++)
+            if (g_planGrp[f] == g_planGrp[e] && g_planTrn[f] == g_planTrn[e])
+                cnt++;
+        g_planSame[e] = cnt + 1;
+    }
+    LOG2("  reassign proximity moved=", ItoA(moved, b1));
+}
+
+static void SessionEnd(const char* why)
+{
+    char b1[16], b2[16];
+    LogParts("auto-load session ENDED (", why ? why : "?",
+             ") frames=", ItoA(g_sessFrame, b1),
+             " released=", ItoA(g_sessReleased, b2), NULL);
+    g_sessActive = 0;
+    g_sessFrame = 0;
+    g_sessReleased = 0;
+    g_nlanes = 0;
+    g_planCount = 0;
+    EndPass();
 }
 
 /* Ares NoManualUnload 过滤 (仅用于运输方):
@@ -923,7 +1161,7 @@ static void AddAssigned(const void* trn, int slots)
     }
 }
 
-static void DoAutoLoad(void)
+static void DoAutoLoad(int forPlan)
 {
     void** items = *(void***)OFF_SELECTION_ITEMS;
     int count = *(int*)OFF_SELECTION_COUNT;
@@ -933,6 +1171,7 @@ static void DoAutoLoad(void)
     int events = 0;
     int remaining = 0;
     int nInfSeen = 0, nTrnSeen = 0, nFlySeen = 0, nVehSeen = 0, nNmuSeen = 0;
+    int nRelSeen = 0;
     int queueFull = 0;
 
     int groupHead[MAX_PASSENGERS];
@@ -959,6 +1198,19 @@ static void DoAutoLoad(void)
         int sz;
         if (!obj)
             continue;
+        if (forPlan && IsReleased(obj))
+        {
+            if (ReleasedHoldsEnter(obj))
+            {
+                /* 还拿着旧 Enter: 保持不变, 重规划时跳过 */
+                nRelSeen++;
+                continue;
+            }
+            /* 旧 Enter 已丢失 (用户 S/改派/引擎清任务): 除名, 当作新单位规划 */
+            UnmarkReleased(obj);
+            LogParts("  stale release (mission lost, replanning): obj=",
+                     HtoA8((unsigned)obj, b1), NULL);
+        }
         vt = *(unsigned int*)obj;
         if (vt != INFANTRY_VTABLE && vt != UNIT_VTABLE)
             continue;
@@ -1047,6 +1299,9 @@ static void DoAutoLoad(void)
     LogParts("usable: passengers=", ItoA(np, b1),
              " (inf=", ItoA(nInfSeen, b2), " veh=", ItoA(nVehSeen, b3),
              ") transports with free slots=", ItoA(nt, b4), NULL);
+    if (forPlan && nRelSeen > 0)
+        LogParts("  already-released (keep old Enter, skipped in replan): ",
+                 ItoA(nRelSeen, b1), NULL, NULL);
 
     if (np <= 0 || nt <= 0)
     {
@@ -1110,13 +1365,10 @@ static void DoAutoLoad(void)
         LOG2("    members=", ItoA(members, b1));
     }
 
-    /* 4b. 组内按就近排序 (v2.4): 超员时离载具近的先占座。
-     * 病根: 第5步按组内链表顺序遍历、先遍历先占座, 而链表顺序=选中数组
-     * 顺序 (表现为地图从上到下), 与距离无关 —— 人多车少时远处的先装、
-     * 身边的反而落选。距离只决定"每个乘客选哪辆车", 不决定"谁有座位"。
-     * 修复: 组内按 (到最近可进载具的距离, 选中顺序) 重排链表; 可进性用
-     * 静态判据 (SizeLimit/载具乘客只进Unit/初始空位), 动态余量仍由第5步
-     * 把关。组间顺序与"已分配最少->最近"选车规则保持不变, 均匀性不受影响。 */
+    /* 4b. Nearest-first order within each group: over capacity, the
+     * nearby units take the seats (not selection order). Key =
+     * (distance to nearest usable carrier, selection index);
+     * members with no usable carrier sort last. */
     {
         long long nearD[MAX_PASSENGERS];
         int g, m, k2;
@@ -1174,18 +1426,12 @@ static void DoAutoLoad(void)
         }
     }
 
-    /* 5. 下发 Enter 事件 —— 组间轮流 (v2.5), 组内就近 (v2.4):
-     *    每轮每组派一个成员 (组内已按最近可进距离排好) 占座, 取完为止。
-     *    v2.4 及之前是整组串行: 前面的组吃光所有座位, 后面的组一个都分不到
-     *    (如 12 磁暴在前、3 动员兵在后争 12 座 → 动员兵全落选)。轮流后各类型
-     *    按人数比例公平分享 (上例 → 3 动员兵全上 + 9 最近的磁暴, 落选最远 3 磁暴)。
-     *    候选载具 (有空位且 SizeLimit 达标) 按 [同类型已分最少 (v2.6) ->
-     *    总已分配最少 -> 距离最近 -> 选中顺序] 挑选:
-     *    第一主键保证同类铺开 (5反+5光+10守争5×4座 → 每要塞 1+1+2, 而不是
-     *    某要塞进2反: 只看总数时跨轮次后距离会把同类吸回同一辆车);
-     *    后续键保多类型均衡 (2gi+6ggi+2BF -> 每要塞 1gi+3ggi) 与就近。
-     *    同类型成员 cost 相同、可进集合相同, 一旦某成员无车可进则整组判死
-     *    (余量只减不增, 后面的同样进不去), 避免空转。 */
+    /* 5. Issue Enter events, round-robin across groups (fair shares).
+     *    Carrier pick: [fewest same-type aboard -> fewest total
+     *    -> nearest -> selection order]. Same type shares cost and
+     *    fit, so a group with no usable carrier is done (budgets
+     *    only shrink). Planning mode then seats each member with
+     *    its nearest carrier at fixed per-carrier counts. */
     {
         int cursor[MAX_PASSENGERS];
         int alive[MAX_PASSENGERS];
@@ -1194,17 +1440,17 @@ static void DoAutoLoad(void)
          * ClickedMission(7, NULL, 载具, NULL) -> 0x646E90):
          *   Target       = {0,0} 空    (执行器 SetTarCom(空): 不设攻击目标)
          *   Destination  = TC(载具对象, RTTI 0x34) (执行器 SetDestination(载具))
-         * v1.2 教训: 把载具放 Target -> SetTarCom(载具) = 攻击目标 -> 步兵开火打载具;
-         * v1.1 教训: Destination 只给格子 -> 步兵走到格旁即放弃 (Area_Guard)。 */
+                   * 把载具放 Target -> SetTarCom(载具) = 攻击目标 -> 步兵开火打载具;
+                   * Destination 只给格子 -> 步兵走到格旁即放弃 (Area_Guard)。 */
         for (g2 = 0; g2 < ngroups; g2++)
         {
             cursor[g2] = groupHead[g2];
             alive[g2] = 1;
             nalive++;
         }
-        while (nalive > 0 && events < MAX_EVENTS_PER_FRAME)
+        while (nalive > 0 && (forPlan || events < MAX_EVENTS_PER_FRAME))
         {
-            for (g2 = 0; g2 < ngroups && events < MAX_EVENTS_PER_FRAME; g2++)
+            for (g2 = 0; g2 < ngroups && (forPlan || events < MAX_EVENTS_PER_FRAME); g2++)
             {
                 int m, best, bestType, bestAssigned, k;
                 long long bestDist = 0;
@@ -1260,6 +1506,35 @@ static void DoAutoLoad(void)
                 tcTarget.RTTI = 0;
                 TCFromObject(&tcDest, ts[best].obj);
 
+                if (forPlan)
+                {
+                    /* 规划模式: 只记账并记录 (乘客,载具,距离), 不下发事件。
+                     * 预算 (freeSlots/assigned/AddAssigned/g_typeAsg) 与下发模式
+                     * 完全相同的时机扣减, 同一分配逻辑、同一记账语义。 */
+                    if (g_planCount < MAX_PASSENGERS)
+                    {
+                        g_planPax[g_planCount] = ps[m].obj;
+                        g_planTrn[g_planCount] = ts[best].obj;
+                        g_planDist[g_planCount] = (int)(bestDist >> 8);
+                        g_planGrp[g_planCount] = g2;
+                        ts[best].freeSlots -= ps[m].cost;
+                        ts[best].assigned++;
+                        AddAssigned(ts[best].obj, ps[m].cost);
+                        g_typeAsg[g2][best]++;
+                        g_planSame[g_planCount] = g_typeAsg[g2][best];
+                        g_planCount++;
+                        events++;
+                        cursor[g2] = nextInGroup[m];
+                        if (cursor[g2] == -1) { alive[g2] = 0; nalive--; }
+                    }
+                    else
+                    {
+                        /* 规划数组满 (理论上限 128): 停掉该组, 与事件上限对齐 */
+                        alive[g2] = 0; nalive--;
+                    }
+                    continue;
+                }
+
                 if (QueueMegaMission(MISSION_ENTER, &tcTarget,
                                      (unsigned int)tcWhom.ID, tcWhom.RTTI, &tcDest))
                 {
@@ -1287,8 +1562,16 @@ static void DoAutoLoad(void)
         }
     }
 
+    if (forPlan && g_planCount > 0)
+        ReassignProximity(); /* 均分计数不变, 组内就近换位消换位跑 */
 report:
-    /* 6. 是否全部处理完毕 */
+    /* 6. 是否全部处理完毕 (规划模式由 session 接管生命周期, 直接返回) */
+    if (forPlan)
+    {
+        LogParts("plan result: pairs planned=", ItoA(events, b1),
+                 " (stagger session will release them)", NULL, NULL);
+        return;
+    }
     for (i = 0; i < np; i++)
         if (!IsDone(ps[i].obj)) remaining++;
     LogParts("frame result: events queued=", ItoA(events, b1),
@@ -1310,6 +1593,292 @@ report:
         EndPass();
     }
     /* 否则保持 g_passActive, 由钩子重新置位 g_wantLoad, 下一帧继续 (OutList 每帧清空) */
+}
+
+/* ---------------- 分波放行: 建道 / 发波 / tick ---------------- */
+
+/* 由 g_plan* 建车道: 同一载具的乘客按距离升序排 (插入排序, 总量<=128)。
+ * 车道顺序即放行顺序 (wave 0 = 最近) 。 */
+static void BuildLanes(void)
+{
+    int p, L, a, b2;
+    char b1[16], bb[16];
+    g_nlanes = 0;
+    for (p = 0; p < g_planCount; p++)
+    {
+        int L2 = -1;
+        for (L = 0; L < g_nlanes; L++)
+            if (g_laneTrn[L] == g_planTrn[p]) { L2 = L; break; }
+        if (L2 < 0)
+        {
+            if (g_nlanes >= MAX_TRANSPORTS)
+                continue; /* 理论上限, 丢弃多余 */
+            L2 = g_nlanes++;
+            g_laneTrn[L2] = g_planTrn[p];
+            g_laneN[L2] = 0;
+        /* Lane order = release order (nearest first). */
+        g_laneNext[L2] = 0;
+        g_laneMoveNext[L2] = 1; /* lane[0] takes Enter, the rest start marched */
+        g_laneGate[L2] = 0;
+        g_laneStall[L2] = 0;
+        g_laneActive[L2] = 0;
+        }
+        L = L2;
+        if (g_laneN[L] < MAX_PASSENGERS)
+        {
+            int n = g_laneN[L]++;
+            g_lanePax[L][n] = g_planPax[p];
+            g_laneDist[L][n] = g_planDist[p];
+            g_laneSame[L][n] = g_planSame[p];
+        }
+    }
+    for (L = 0; L < g_nlanes; L++)
+    {
+        for (a = 1; a < g_laneN[L]; a++)
+        {
+            void* cp = g_lanePax[L][a];
+            int cd = g_laneDist[L][a], cs = g_laneSame[L][a];
+            b2 = a - 1;
+            while (b2 >= 0 && g_laneDist[L][b2] > cd)
+            {
+                g_lanePax[L][b2 + 1] = g_lanePax[L][b2];
+                g_laneDist[L][b2 + 1] = g_laneDist[L][b2];
+                g_laneSame[L][b2 + 1] = g_laneSame[L][b2];
+                b2--;
+            }
+            g_lanePax[L][b2 + 1] = cp;
+            g_laneDist[L][b2 + 1] = cd;
+            g_laneSame[L][b2 + 1] = cs;
+        }
+        LogParts("  lane trn=", HtoA8((unsigned)g_laneTrn[L], b1),
+                 " npax=", ItoA(g_laneN[L], bb), NULL, NULL);
+    }
+}
+
+/* 下发一对规划好的 Enter 事件 (事件布局与真实点击一致, 见第5步注释)。
+ * 返回 1 = 已入队 (OutList 满返回 0, 调用方下帧重试)。 */
+static int IssuePlanned(void* pax, void* trn, int wave, int tSame, int dist)
+{
+    TargetClass tcWhom, tcDest, tcTarget;
+    char b1[16], b2[16], b3[16], b4[16], b5[16];
+    TCFromObject(&tcWhom, pax);
+    tcTarget.ID = 0;
+    tcTarget.RTTI = 0;
+    TCFromObject(&tcDest, trn);
+    if (!QueueMegaMission(MISSION_ENTER, &tcTarget,
+                          (unsigned int)tcWhom.ID, tcWhom.RTTI, &tcDest))
+        return 0;
+    LogParts("  release wave=", ItoA(wave, b1),
+             " unit=", HtoA8((unsigned)pax, b2),
+             " -> trn=", HtoA8((unsigned)trn, b3),
+             " tSame=", ItoA(tSame, b4),
+             " dist=", ItoA(dist, b5), NULL);
+    return 1;
+}
+
+/* 下发一对 Move 行军事件 (先走后进): 乘客走到载具所在格附近待命,
+ * 不进链 (Move 不发 RequestLoading), 故多人并行行军不抢槽。
+ * 事件布局与原生点地移动一致: Target={0,0}空, Destination=格子TC
+ * (ID=X+1000*Y, RTTI=11=Cell)。返回 1 = 已入队。 */
+static int IssueMarch(void* pax, int cellX, int cellY, int wave)
+{
+    TargetClass tcWhom, tcDest, tcTarget;
+    char b1[16], b2[16], b3[16], b4[16];
+    TCFromObject(&tcWhom, pax);
+    tcTarget.ID = 0;
+    tcTarget.RTTI = 0;
+    tcDest.ID = cellX + 1000 * cellY;
+    tcDest.RTTI = RTTI_CELL;
+    if (!QueueMegaMission(MISSION_MOVE, &tcTarget,
+                          (unsigned int)tcWhom.ID, tcWhom.RTTI, &tcDest))
+        return 0;
+    LogParts("  march wave=", ItoA(wave, b1),
+             " unit=", HtoA8((unsigned)pax, b2),
+             " -> cell=", ItoA(cellX, b3),
+             ",", ItoA(cellY, b4), NULL);
+    return 1;
+}
+
+/* 载具所在格 (lepton>>8, 供 Move 目的地; 规划当帧取值, 载具静止时精确) */
+static void TransportCell(const void* trn, int* cx, int* cy)
+{
+    const int* lc = (const int*)((const char*)trn + OFF_LOCATION);
+    *cx = lc[0] >> 8;
+    *cy = lc[1] >> 8;
+}
+
+/* 补发行军队所有待发 Move (失败即停, 下 tick 重试)。 */
+static void PumpMoves(int L)
+{
+    while (g_laneMoveNext[L] < g_laneN[L])
+    {
+        void* pax = g_lanePax[L][g_laneMoveNext[L]];
+        int cx, cy;
+        if (!ObjAliveInTechnoArray(g_laneTrn[L]))
+            return; /* 载具没了, 调用方判死车道 */
+        if (!ObjAliveInTechnoArray(pax))
+        {
+            char b1[16];
+            LOG2("  march skip dead/gone passenger: obj=",
+                 HtoA8((unsigned)pax, b1));
+            g_laneMoveNext[L]++;
+            continue;
+        }
+        TransportCell(g_laneTrn[L], &cx, &cy);
+        if (!IssueMarch(pax, cx, cy, g_laneMoveNext[L]))
+            return; /* OutList 满, 下 tick 重试 */
+        g_laneMoveNext[L]++;
+    }
+}
+
+/* New session: plan -> first Enter wave + Move marches ->
+ * occupancy-gated Enter. isReplace=1 (old session still live):
+ * keep the released set, its Enters stand. isReplace=0 (fresh):
+ * clear the set, else last round's units are skipped forever. */
+static void StartSession(int isReplace)
+{
+    int L, released0 = 0;
+    char b1[16], b2[16];
+    g_passActive = 0;
+    g_doneCount = 0;
+    g_asgCount = 0;
+    ClearTypeAsg();
+    g_planCount = 0;
+    g_nlanes = 0;
+    g_sessFrame = 0;
+    g_sessReleased = 0;
+    if (!isReplace && g_relCount > 0)
+    {
+        LOG2("  released set cleared (fresh session): count=",
+             ItoA(g_relCount, b1));
+        g_relCount = 0;
+    }
+    LOGS("--- auto-load session planning ---");
+    DoAutoLoad(1);
+    if (g_planCount <= 0)
+    {
+        LOGS("auto-load session: nothing assigned, no session");
+        EndPass();
+        return;
+    }
+    BuildLanes();
+    LogParts("--- auto-load session started: lanes=", ItoA(g_nlanes, b1),
+             " pairs=", ItoA(g_planCount, b2), " ---", NULL);
+    g_sessActive = 1;
+    for (L = 0; L < g_nlanes; L++)
+    {
+        /* 首波 (最近者) 直接拿 Enter (空槽直链, 第一个上); 其余 PumpMoves
+         * 行军待命, occ 上涨才逐个转 Enter (SessionTick 门控)。 */
+        if (!ObjAliveInTechnoArray(g_laneTrn[L]) ||
+            !ObjAliveInTechnoArray(g_lanePax[L][0]))
+        {
+            LogParts("  lane trn=", HtoA8((unsigned)g_laneTrn[L], b1),
+                     " wave0 skipped (stale)", NULL, NULL);
+            g_laneNext[L] = 1;
+            g_laneGate[L] = 0;
+            PumpMoves(L);
+            continue;
+        }
+        if (IssuePlanned(g_lanePax[L][0], g_laneTrn[L], 0,
+                         g_laneSame[L][0], g_laneDist[L][0]))
+        {
+            MarkReleased(g_lanePax[L][0]);
+            released0++;
+            g_laneNext[L] = 1;
+            g_laneActive[L] = g_lanePax[L][0];
+            g_laneGate[L] = GetUsedSlots(g_laneTrn[L]);
+            g_laneStall[L] = 0;
+        }
+        else
+        {
+            LOGS("  wave0 event queue full - retry next frame");
+            g_laneGate[L] = 0;
+        }
+        PumpMoves(L);
+    }
+    g_sessReleased = released0;
+}
+
+/* 每帧推进 session: 到期的车道放下一波 (先校验指针, 死亡/消失则丢弃)。
+ * 全部车道放完或超时则结束。 */
+static void SessionTick(void)
+{
+    int L, allDone;
+    char b1[16];
+    if (!g_sessActive)
+        return;
+    g_sessFrame++;
+    if (g_sessFrame > SESS_MAX_FRAMES)
+    {
+        SessionEnd("timeout");
+        return;
+    }
+    PruneReleased();
+    for (L = 0; L < g_nlanes; L++)
+    {
+        if (g_laneNext[L] >= g_laneN[L] && g_laneMoveNext[L] >= g_laneN[L])
+            continue; /* 本车道 Enter/Move 全发完 */
+        if (!ObjAliveInTechnoArray(g_laneTrn[L]))
+        {
+            LogParts("  lane trn=", HtoA8((unsigned)g_laneTrn[L], b1),
+                     " transport gone, lane dropped", NULL, NULL);
+            g_laneNext[L] = g_laneN[L];
+            g_laneMoveNext[L] = g_laneN[L];
+            continue;
+        }
+        /* 先补发行军, 再看 Enter 门 (每 tick 每车道最多转一个 Enter) */
+        PumpMoves(L);
+        if (g_laneNext[L] > 0 && g_laneNext[L] < g_laneN[L])
+            g_laneStall[L]++; /* 现任无进展计数 */
+        if (g_laneNext[L] < g_laneN[L])
+        {
+            /* Enter 门: 首波未发直接发; 否则等 occ 上涨 (有人上车, 槽空出来) /
+             * 现任死亡 / 超时。门内同一时刻最多一个未上车的 Enter 持有者,
+             * 槽交接无竞争, 顺序=车道顺序。 */
+            void* pax = g_lanePax[L][g_laneNext[L]];
+            int occNow = GetUsedSlots(g_laneTrn[L]);
+            int activeDead = (g_laneNext[L] > 0 && g_laneActive[L] &&
+                              !ObjAliveInTechnoArray(g_laneActive[L]));
+            int stallOut = (g_laneStall[L] > STALL_MAX_FRAMES);
+            int gateOpen = (g_laneNext[L] == 0 || occNow > g_laneGate[L] ||
+                            activeDead || stallOut);
+            if (gateOpen)
+            {
+                if (!ObjAliveInTechnoArray(pax))
+                {
+                    LOG2("  skip dead/gone passenger: obj=",
+                         HtoA8((unsigned)pax, b1));
+                    g_laneNext[L]++;
+                    g_laneStall[L] = 0;
+                }
+                else
+                {
+                    if (activeDead)
+                        LOGS("  lane advance: active dead");
+                    else if (stallOut && occNow <= g_laneGate[L])
+                        LOGS("  lane advance: stall timeout");
+                    if (IssuePlanned(pax, g_laneTrn[L], g_laneNext[L],
+                                     g_laneSame[L][g_laneNext[L]],
+                                     g_laneDist[L][g_laneNext[L]]))
+                    {
+                        MarkReleased(pax);
+                        g_sessReleased++;
+                        g_laneActive[L] = pax;
+                        g_laneNext[L]++;
+                        g_laneGate[L] = occNow;
+                        g_laneStall[L] = 0;
+                    }
+                    /* 入队失败 (OutList 满): 不推进, 下帧重试 */
+                }
+            }
+        }
+    }
+    allDone = 1;
+    for (L = 0; L < g_nlanes; L++)
+        if (g_laneNext[L] < g_laneN[L] ||
+            g_laneMoveNext[L] < g_laneN[L]) { allDone = 0; break; }
+    if (allDone)
+        SessionEnd("all released");
 }
 
 /* ---------------- Syringe 接口 ---------------- */
@@ -1343,8 +1912,8 @@ __declspec(dllexport) HRESULT __cdecl SyringeHandshake(SyringeHandshakeInfo* pIn
     }
     if (pInfo->Message && pInfo->cchMessage > 0)
     {
-        const char* head = "AutoLoad 2.6: press ";
-        const char* mid = " to load; ";
+        const char* head = "AutoLoad: press ";
+        const char* mid = " to load (march+stagger); ";
         const char* tail = " to select same IFV variant (T-filtered).";
         int i = 0, k;
         for (k = 0; head[k] && i < pInfo->cchMessage - 1; k++) pInfo->Message[i++] = head[k];
@@ -1383,10 +1952,17 @@ __declspec(dllexport) DWORD __cdecl AutoLoad_FrameHook(void* regs)
     }
     if (InterlockedExchange(&g_wantLoad, 0))
     {
-        if (g_passActive)
+        if (g_stagger)
+        {
+            /* 延迟 1 帧再 (重) 规划, 与旧 pass 的 arming 一致;
+             * StartSession 会顶掉进行中的旧 session */
+            s_armed = 1;
+            s_countdown = 1;
+        }
+        else if (g_passActive)
         {
             /* 上一轮未完成的延续: 不再延迟, 立即继续 */
-            DoAutoLoad();
+            DoAutoLoad(0);
             if (g_passActive)
                 InterlockedExchange(&g_wantLoad, 1); /* 未完, 下一帧继续 */
         }
@@ -1400,15 +1976,25 @@ __declspec(dllexport) DWORD __cdecl AutoLoad_FrameHook(void* regs)
     else if (s_armed && --s_countdown <= 0)
     {
         s_armed = 0;
-        g_passActive = 1;
-        g_doneCount = 0;
-        g_asgCount = 0;
-        ClearTypeAsg(); /* 同类型计数与本轮预算同寿命 */
-        LOGS("--- auto-load pass started ---");
-        DoAutoLoad();
-        if (g_passActive)
-            InterlockedExchange(&g_wantLoad, 1); /* 未完, 下一帧继续 */
+        if (g_stagger)
+        {
+            /* live session=replace (keep released set); ended=fresh (clear it) */
+            StartSession(g_sessActive ? 1 : 0);
+        }
+        else
+        {
+            g_passActive = 1;
+            g_doneCount = 0;
+            g_asgCount = 0;
+            ClearTypeAsg(); /* 同类型计数与本轮预算同寿命 */
+            LOGS("--- auto-load pass started ---");
+            DoAutoLoad(0);
+            if (g_passActive)
+                InterlockedExchange(&g_wantLoad, 1); /* 未完, 下一帧继续 */
+        }
     }
+    if (g_sessActive)
+        SessionTick(); /* session runs on the presser's machine only */
     return 0; /* 0 = 恢复原指令并正常继续 */
 }
 

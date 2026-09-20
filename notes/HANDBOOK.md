@@ -74,13 +74,26 @@
    超员时近者先得；无可进载具者 key=INF 排最后。
 5. **组间轮流 + 选车**：每轮每组派一个成员占座。选车四级：
    **同类型已分最少 → 总已分配最少 → 距离最近 → 选中顺序**。
-   第一级保证同类铺开（如 5 反 + 5 光 + 10 守卫争 5 辆×4 座必得每车 1+1+2，
-   与站位无关）；后三级保总数均衡与就近。选满/`OutList` 满（每帧 ≤96 条）
-   即停，满则下帧续传（靠已办名单 + 预算去重）。
+   第一级保证同类铺开（均分优先，如 2+8 争两车必得每车 1+4）。
+   规划模式随后做**组内就近换位**：每组每车几人定死不动，只把
+   成员换到离自己近的车上（贪心取最短人车对），消除“两边站好人却对调跑
+   远路”（位置合适时的换位跑）；位置不好时的跑远是必要的，保留。选满/`OutList` 满（每帧 ≤96 条）即停，满则下帧续传。
 6. **整组判死**：同类型成员 cost 相同、可进集合相同，一旦某成员无车可进，
    整组退出（余量只减不增，后面的同样进不去），避免空转。
 7. **结束**：全部办完 → 完成；有剩余但本帧零下发 → 范围内无空位，结束；
-   队列满 → 保持，下帧继续。
+   队列满 → 保持，下帧继续（以上是 `Stagger=0` 的单帧下发行为）。
+8. **先走后进**（默认，`Stagger=1`）：分配一次算完记入规划表，发令
+   分两路——车道内最近者首波直接拿 `Enter`（空槽直链，第一个上）；
+   其余先拿 `Move`（目的地=载具所在格，`Target={0,0}` + `Destination=格子TC`，
+   `ID=X+1000*Y`，`RTTI=11=Cell`），并行行军但不进链、不抢槽；
+   载具每上一个人（`occ` 上涨）下一个才转 `Enter`。同一时刻最多一个未上车
+   的 `Enter` 持有者，槽交接无竞争，上车顺序=车道距离序，总耗时≈最远行军
+   + N×轮询。现任死亡立即越过；现任 300 帧无进展（任务丢失/载具被开走）
+   也越过并写日志。`Stagger=0` 回到第 7 步的旧行为（同帧全下发，顺序随机）。
+   已放行名单（released 集）只在**全新**一轮（旧 session 已结束）开始时清空；
+   顶替进行中的旧 session 时保留，但只跳过**还拿着旧 `Enter`**（任务号=7）
+   的单位；任务已丢失（用户按 S / 手动改派 / 引擎清任务）的除名重规划，
+   否则被停掉的单位会被永久跳过。
 
 ## 5. 过滤规则
 
@@ -123,15 +136,25 @@ gcc -O2 -Wall -Wextra -ffreestanding -shared -o dist/AutoLoad.dll src/AutoLoad.c
 
 ## 8. 日志速查（带日志版，游戏目录 `AutoLoad.log`）
 
-- `config: hotkey = … / variant hotkey = …`：实际生效键（文件缺失即默认）。
+- `config: hotkey = … / variant hotkey = … / stagger = …`：实际生效键与分波
+  配置（文件缺失即默认）。
+- `released set cleared (fresh session): count=…`：全新一轮清空已放行名单
+ （顶替旧 session 时不出现此行，名单保留）。
 - `group N type=…` + `  #序号 obj=… d2cells=…`：组内就近顺序（距离平方/格²，
   `NO TRANSPORT` = 无可进载具）。
-- `queue enter: unit=… -> trn=… cost=… tSame=… dist=…`：下发记录；
-  `tSame` = 该车接完后车上同类数（理想分配里小类型应全是 1）；
+- `plan result: pairs planned=…`：规划对数。
+- `reassign proximity moved=…`：组内换位人数；位置已站好时应为 0，
+  `release wave` 的 `dist=` 不应出现万级。
+- `queue enter: unit=… -> trn=… cost=… tSame=… dist=…`（`Stagger=0` 时）：
+  下发记录；`tSame` = 该车接完后车上同类数（理想分配里小类型应全是 1）；
   `dist` = 与所选车的距离（`>>8`，单调）。
+- `release wave=W unit=… -> trn=… tSame=… dist=…`（`Stagger=1` 时）：`Enter`
+  下发记录（只有持槽顺序，`W` 即车道距离序）。
+- `march wave=W unit=… -> cell=X,Y`：`Move` 行军下发记录。
+  `lane advance: active dead / stall timeout`：现任死亡或 300 帧无进展越过。
 - `group out of slots …`：某类型无车可进，整组剩余落选（正常超员现象）。
 - `frame result: events queued=… units remaining=…` → `auto-load pass COMPLETE`
-  / `ENDED, leftover units=… (no slots in range)`。
+  / `ENDED, leftover units=… (no slots in range)`（`Stagger=0` 时）。
 - `variant-select: refs=… scope=SCREEN/MAP` + `refN: type=… cur=a/b wpn=…` +
   `group: type=… wpn=… n=… MATCHED`：变体选择的参照与候选直方图
   （组数应等于实际武器数，`MATCHED` = 命中本次参照）。
@@ -142,7 +165,43 @@ gcc -O2 -Wall -Wextra -ffreestanding -shared -o dist/AutoLoad.dll src/AutoLoad.c
 [AutoLoad]
 Hotkey=Ctrl+D
 VariantHotkey=Ctrl+T
+Stagger=1
 ```
 
 语法：`[Ctrl+][Alt+][Shift+][Win+]主键`，主键 A-Z/0-9/F1-F24/方向键等，
 大小写不敏感；`None` 禁用；非法值回落默认并写日志。缺文件即默认值。
+`Stagger=0` 关闭分波（同帧全下发，顺序随机）。
+
+## 10. 引擎上车顺序机制（结论）
+
+- 引擎里**没有上车排队，但有链路独占**：`UnitClass::ReceiveCommand` 对
+  `RequestLoading(14)`（`0x7377D8`，经 `0x737B54` 跳表确认）只做三件事——
+  移动中（`Is_Moving` 且 `CurrentMission==Move(2)`）/超载/超 `SizeLimit`
+  答 `Negative(0xA)`；与载具不在同一 movement zone
+  （`0x56D230=MapClass::GetMovementZoneType`）答 `0xE`（继续等）；
+  **其余全部答 `Positive(1)`**。
+- 上车动作在乘客侧：`FootClass::Mission_Enter(0x4D9290)` 拿到 `Positive`
+  且 locomotor 已到达 → 当场进舱；还在路上 → 继续走。
+- `Mission_Enter` **不是每帧跑**：尾部（`0x4D946C`）返回下次执行的帧延迟
+  `= F2I(Rate×900) + RandomRanged(0,2)`（`0x65C7E0`，RNG 是联机同步的
+  `Scenario.Random`）。`Rate` 默认值 `0.016`（`MissionControl` 构造
+  `0x5B3700` 全任务统一，`rulesmo.ini` 无 `[Enter]` 覆盖段）→
+  **单轮询延迟 = F2I(14.4)+0~2 = 14~16 帧（约 1 秒）**。
+- **链路是独占槽 + 等待者，交接只发生在上车瞬间，由 log 实测**（1 车 4 兵）：
+  空槽时首个请求者直链（`RequestLink`，`tLink0` 立刻指向它）并跑 Enter；
+  非持槽者被引擎改派 Move 靠站（任务号读数 7→2）、Move 走完转 Guard（2→5）
+  原地等，全程无链；每次上车瞬间槽交接给一个等待者（持槽者到达后约一个
+  轮询周期即上）。
+- **交接给谁是轮询竞态**：五次交接实测里，顺序/距离/LIFO/FIFO 没有任何
+  确定性规则能同时解释——槽给交接后第一个轮询到的等待者（各 14~16 帧独立
+  相位 + 同步抖动），纯运气。
+  推论：任何“先后下发 Enter”的办法（同帧、顺序分波、倒序分波）都控不住顺序。
+- **唯一确定性做法**：交接瞬间只留一个等待者。`Enter` 只在 `occ`
+  上涨（上一个人上车、槽空出）后才发给下一个；其余人拿 `Move` 并行走路
+  （`Move` 不发 `RequestLoading`，不进链、不抢槽）。`Move` 事件布局与原生
+  点地移动一致（`Destination=格子TC`）。现任死亡/300 帧超时则越过，保证
+  不死锁。速度≈最远行军 + N×轮询（行军并行，只串行上车本身）。
+- 日志指纹（认“上完”）：载具 `occ` 跳变即上车帧；上车不离 Techno Array。
+- 联机安全：抖动用的是同步 RNG，各客户端看到的上车顺序逐帧一致；
+  分波/倒序仍是单一下令者走广播命令。红线：不写模拟内存、不用非同步
+  RNG/墙钟做模拟决策。
