@@ -6,6 +6,7 @@
  * 功能1 装车: 按下热键时, 把【选中的步兵和载具】按类型均衡分配进【选中的、
  *       范围内、有空位且装载等级达标】的可载员载具: 各类型轮流派成员占座
  *       (人数少的类型不会被淹没), 每辆车优先接"还没有的同类型"
+ *       (含车内已有存量, 如某要塞已有 3B 则新兵优先补 A 凑 1A+3B),
  *       (同类强制铺开, 如每要塞 1反+1光+2守), 同类型内离载具近的优先
  *       (超员时远处的落选, 而不是选中顺序/地图从上到下在前者先得)。
  *       只处理选中单位; 装不下的
@@ -18,6 +19,9 @@
  *       多人并行不抢槽), 载具每上一个人 (occ 上涨) 下一个才转 Enter —— 同一时刻
  *       最多一个未上车的 Enter 持有者, 槽交接无竞争, 上车顺序=距离序, 总耗时≈
  *       最远行军+ N×轮询。现任死亡/任务丢失/超时 300 帧无进展则越过。
+ *       用户接管优先: 现任被 S(Stop)/改派且无上车进展则整车道丢弃;
+ *       待发成员被 S/改派/另有 Enter 在身则跳过 (Guard 且距车 10 格外
+ *       视为半路被停), 不再复活用户停掉的单位。
  *       Stagger=0 回到 legacy 行为 (同帧全下发, 顺序随机)。
  *
  * 功能2 变体选择: IFV逻辑载具 (FV/AMC/TRACTOR/STING 等 Gunner=yes) 随载员不同
@@ -79,6 +83,9 @@ void* memset(void* s, int c, unsigned n)
 
 #define OFF_LOCATION          0x9C   /* ObjectClass::Location (CoordStruct, lepton) */
 #define OFF_PASSENGERS        0x114  /* TechnoClass::Passengers (PassengersClass, Num 在 +0) */
+#define OFF_PAX_FIRST         0x4    /* PassengersClass::FirstPassenger (车内链表头, YRpp TechnoClass.h) */
+#define OFF_NEXT_OBJECT       0x30   /* ObjectClass::NextObject (车内链表后继,
+                                          GetTotalSize 0x473460 反汇编确认: mov esi,[esi+0x30]) */
 #define OFF_TYPE_INFANTRY     0x6C0  /* InfantryClass::Type */
 #define OFF_TYPE_UNIT         0x6C4  /* UnitClass::Type */
 #define OFF_TYPE_BUILDING     0x520  /* BuildingClass::Type */
@@ -127,6 +134,7 @@ void* memset(void* s, int c, unsigned n)
 #define OFF_TTYPE_GUNNER      0x805
 #define OFF_TTYPE_WEAPONCOUNT 0x80C
 #define OFF_TTYPE_IDSTR       0x24
+#define OFF_TECHNO_MISSION    0xAC   /* TechnoClass::CurrentMission (int; 7=Enter, 见 ReleasedHoldsEnter) */
 #define OFF_TECHNO_CURWEAPON  0x138
 #define VARIANT_DBL_MS        500u /* Ctrl+T 双击窗口: 对齐原生T键的0x1F4=500ms */
 #define MAX_VARIANT_REFS      64
@@ -141,11 +149,17 @@ void* memset(void* s, int c, unsigned n)
 
 #define MISSION_ENTER   7
 #define MISSION_MOVE    2   /* 行军 (先走后进, Destination=格子TC) */
+#define MISSION_GUARD   5   /* 行军到位/原地待命 (YRpp Mission) */
+#define MISSION_AREA_GUARD 11 /* 步兵类待命变体 (YRpp Mission) */
+#define MISSION_STOP    13  /* 用户 S/停止按钮 (YRpp Mission); 引擎自身永不派生,
+                               见到即用户接管, 与重映射按键无关 */
 #define RTTI_CELL       11  /* TargetClass RTTI: 格子 (ID = X+1000*Y, 见 YRpp TargetClass.h) */
 #define MAX_PASSENGERS  128
 #define MAX_TRANSPORTS  64
 #define MAX_EVENTS_PER_FRAME 96
 #define RANGE_LEPTONS   (30 * 256)  /* "附近"半径: 30 格 (与任一选中乘客的平面距离) */
+#define NEAR_LEPTONS    (10 * 256)  /* "到位"半径: 距车 10 格内且 Guard=到位待命,
+                                       之外且 Guard=半路被用户停掉 (或车开走跟丢) */
 
 /* Session watchdog: a normal session ends in dozens of frames;
  * SESS_MAX_FRAMES is a pure backstop. Boarding latency itself comes
@@ -660,6 +674,7 @@ typedef struct
     int   laneGate[MAX_TRANSPORTS];     /* 现任 Enter 下发时的 occ */
     int   laneStall[MAX_TRANSPORTS];    /* 现任无进展帧数 */
     void* laneActive[MAX_TRANSPORTS];   /* 现任 (最后下发 Enter 者) */
+    int   laneEverEnter[MAX_TRANSPORTS]; /* 现任是否曾拿住 Enter (拿住后丢失=用户接管) */
 } ALSession;
 
 static ALSession g_sess[MAX_SESSIONS];
@@ -730,14 +745,14 @@ static void UnmarkReleased(const void* obj)
     }
 }
 
-/* A released unit still holding its Enter (+0xAC = mission, 7 = Enter)?
+/* A released unit still holding its Enter (mission == 7)?
  * A user Stop / manual redirect / engine-cleared mission voids the old Enter,
  * so such units must be unmarked and replanned (else skipped forever). */
 static int ReleasedHoldsEnter(const void* obj)
 {
     if (!ObjAliveInTechnoArray((void*)obj))
         return 0;
-    return (*(int*)((char*)obj + 0xAC) == 7);
+    return (*(int*)((char*)obj + OFF_TECHNO_MISSION) == MISSION_ENTER);
 }
 
 /* Drop dead/gone entries (boarding does NOT remove array entries). */
@@ -1555,9 +1570,43 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
         }
     }
 
+    /* 4c. 存量种子: 选车四级规则的"同类型已分/总数"含车内已有人数。
+     * 车内链表 PassengersClass{Num +0, FirstPassenger +4} (YRpp),
+     * 经 ObjectClass::NextObject (+0x30) 串联, 上限 Num (钳位防坏链)。
+     * 每个指针先验活再碰类型, 无对应分组的类型只计总数不计分型。
+     * 否则有存量的车会被多派新兵: 如某要塞已有 3B, 2A+6B 进两车应得
+     * 每车 1A+3B, 但从 0 起算会错成 0A+4B / 2A+2B。 */
+    {
+        int k2;
+        for (k2 = 0; k2 < nt; k2++)
+        {
+            char* pax = *(char**)((char*)ts[k2].obj + OFF_PASSENGERS + OFF_PAX_FIRST);
+            int n = *(int*)((char*)ts[k2].obj + OFF_PASSENGERS);
+            int walked = 0, total = 0;
+            if (n < 0) n = 0;
+            if (n > MAX_PASSENGERS) n = MAX_PASSENGERS;
+            while (pax && walked < n)
+            {
+                unsigned int pt;
+                int g3;
+                if (!ObjAliveInTechnoArray(pax)) break;
+                pt = TypeOfObj(pax);
+                for (g3 = 0; g3 < ngroups; g3++)
+                    if ((unsigned int)groupType[g3] == pt) { g_typeAsg[g3][k2]++; break; }
+                total++;
+                walked++;
+                pax = *(char**)(pax + OFF_NEXT_OBJECT);
+            }
+            ts[k2].assigned = total;
+            if (total > 0)
+                LogParts("  aboard seed: trn=", HtoA8((unsigned)ts[k2].obj, b1),
+                         " total=", ItoA(total, b2), NULL, NULL);
+        }
+    }
+
     /* 5. Issue Enter events, round-robin across groups (fair shares).
-     *    Carrier pick: [fewest same-type aboard -> fewest total
-     *    -> nearest -> selection order]. Same type shares cost and
+     *    Carrier pick: [fewest same-type (incl. aboard, seeded in 4c)
+     *    -> fewest total (incl. aboard) -> nearest -> selection order]. Same type shares cost and
      *    fit, so a group with no usable carrier is done (budgets
      *    only shrink). Planning mode then seats each member with
      *    its nearest carrier at fixed per-carrier counts. */
@@ -1751,6 +1800,7 @@ static void BuildLanes(ALSession* s)
         s->laneGate[L2] = 0;
         s->laneStall[L2] = 0;
         s->laneActive[L2] = 0;
+        s->laneEverEnter[L2] = 0;
         }
         L = L2;
         if (s->laneN[L] < MAX_PASSENGERS)
@@ -1836,8 +1886,11 @@ static void TransportCell(const void* trn, int* cx, int* cy)
     *cy = lc[1] >> 8;
 }
 
-/* 补发行军队所有待发 Move (失败即停, 下 tick 重试)。 */
-static void PumpMoves(ALSession* s, int L)
+/* 补发行军队所有待发 Move (失败即停, 下 tick 重试)。
+ * isStart=1 (建道当刻): 初始命令无条件发 —— 用户刚按了热键就是要装。
+ * isStart=0 (后续 tick 补发): 尊重用户接管, Stop(用户S)/已拿 Enter
+ * (手动或别 session) 的不再行军覆盖, 交给 Enter 门处理。 */
+static void PumpMoves(ALSession* s, int L, int isStart)
 {
     while (s->laneMoveNext[L] < s->laneN[L])
     {
@@ -1852,6 +1905,20 @@ static void PumpMoves(ALSession* s, int L)
                  HtoA8((unsigned)pax, b1));
             s->laneMoveNext[L]++;
             continue;
+        }
+        if (!isStart)
+        {
+            int mm = *(int*)((char*)pax + OFF_TECHNO_MISSION);
+            if (mm == MISSION_STOP || mm == MISSION_ENTER)
+            {
+                char b1[16];
+                LOG2(mm == MISSION_STOP ?
+                     "  march skip user-stopped passenger: obj=" :
+                     "  march skip Enter-held passenger: obj=",
+                     HtoA8((unsigned)pax, b1));
+                s->laneMoveNext[L]++;
+                continue;
+            }
         }
         TransportCell(s->laneTrn[L], &cx, &cy);
         if (!IssueMarch(pax, cx, cy, s->laneMoveNext[L]))
@@ -1918,7 +1985,7 @@ static void StartSessionFromSnapshot(int isReplace, void** snapItems, int snapCo
                      " wave0 skipped (stale)", NULL, NULL);
             s->laneNext[L] = 1;
             s->laneGate[L] = 0;
-            PumpMoves(s, L);
+            PumpMoves(s, L, 1);
             continue;
         }
         if (IssuePlanned(s->lanePax[L][0], s->laneTrn[L], 0,
@@ -1936,7 +2003,7 @@ static void StartSessionFromSnapshot(int isReplace, void** snapItems, int snapCo
             LOGS("  wave0 event queue full - retry next frame");
             s->laneGate[L] = 0;
         }
-        PumpMoves(s, L);
+        PumpMoves(s, L, 1);
     }
     s->sessReleased = released0;
 }
@@ -1966,8 +2033,9 @@ static void SessionTickOne(ALSession* s, int idx)
             s->laneMoveNext[L] = s->laneN[L];
             continue;
         }
-        /* 先补发行军, 再看 Enter 门 (每 tick 每车道最多转一个 Enter) */
-        PumpMoves(s, L);
+        /* 先补发行军 (重试模式尊重用户接管), 再看 Enter 门
+         * (每 tick 每车道最多转一个 Enter) */
+        PumpMoves(s, L, 0);
         if (s->laneNext[L] > 0 && s->laneNext[L] < s->laneN[L])
             s->laneStall[L]++; /* 现任无进展计数 */
         if (s->laneNext[L] < s->laneN[L])
@@ -1977,10 +2045,42 @@ static void SessionTickOne(ALSession* s, int idx)
              * 槽交接无竞争, 顺序=车道顺序。 */
             void* pax = s->lanePax[L][s->laneNext[L]];
             int occNow = GetUsedSlots(s->laneTrn[L]);
+            int occRisen = (occNow > s->laneGate[L]);
+            int mAct = -999; /* 现任任务号取样 (只读) */
             int activeDead = (s->laneNext[L] > 0 && s->laneActive[L] &&
                               !ObjAliveInTechnoArray(s->laneActive[L]));
+            if (s->laneNext[L] > 0 && s->laneActive[L] &&
+                ObjAliveInTechnoArray(s->laneActive[L]))
+            {
+                mAct = *(int*)((char*)s->laneActive[L] + OFF_TECHNO_MISSION);
+                if (mAct == MISSION_ENTER)
+                    s->laneEverEnter[L] = 1;
+            }
+            /* 用户接管现任 (且无上车进展) 则整车道丢弃。Stop 一定是用户 S;
+             * 拿住 Enter 后的 Guard/AreaGuard 在单持槽流程里也只可能是用户 S
+             * (链路独占下现任恒持槽, 引擎对非持槽等待者只改派 Move) —— 唯一的
+             * 例外是载具自己在开, 此时追车的合法等待, 不误杀。其它杂项任务号
+             * 更是用户改派无疑。别逐个复活用户停掉的。 */
+            int trnMoving =
+                (*(int*)((char*)s->laneTrn[L] + OFF_TECHNO_MISSION) == MISSION_MOVE);
+            if (s->laneNext[L] > 0 && !occRisen && !activeDead && mAct != -999 &&
+                (mAct == MISSION_STOP ||
+                 (s->laneEverEnter[L] && mAct != MISSION_ENTER &&
+                  mAct != MISSION_MOVE &&
+                  ((mAct != MISSION_GUARD && mAct != MISSION_AREA_GUARD) ||
+                   !trnMoving))))
+            {
+                char b4[16];
+                LogParts("  lane aborted: active taken over (user stop?) unit=",
+                         HtoA8((unsigned)s->laneActive[L], b1),
+                         " mission=", ItoA(mAct, b4), NULL);
+                s->laneNext[L] = s->laneN[L];
+                s->laneMoveNext[L] = s->laneN[L];
+                continue;
+            }
+            {
             int stallOut = (s->laneStall[L] > STALL_MAX_FRAMES);
-            int gateOpen = (s->laneNext[L] == 0 || occNow > s->laneGate[L] ||
+            int gateOpen = (s->laneNext[L] == 0 || occRisen ||
                             activeDead || stallOut);
             if (gateOpen)
             {
@@ -1993,9 +2093,42 @@ static void SessionTickOne(ALSession* s, int idx)
                 }
                 else
                 {
+                    int go = 1; /* 是否仍可下发 Enter */
+                    if (s->laneNext[L] > 0)
+                    {
+                        int mm = *(int*)((char*)pax + OFF_TECHNO_MISSION);
+                        if (mm == MISSION_MOVE)
+                            go = 1; /* 我们的行军/引擎改派靠站, 正常 */
+                        else if (mm == MISSION_GUARD || mm == MISSION_AREA_GUARD)
+                        {
+                            /* 到位待命 vs 半路被 S: 距车 10 格内算前者,
+                             * 远的当用户半路停掉 (车开走跟丢的也顺带收尾)。 */
+                            long long dd = Dist2Leptons(pax, s->laneTrn[L]);
+                            go = (dd <= (long long)NEAR_LEPTONS * NEAR_LEPTONS);
+                            if (!go)
+                                LogParts("  skip far Guard passenger (stopped en route?): obj=",
+                                         HtoA8((unsigned)pax, b1), NULL, NULL);
+                        }
+                        else
+                        {
+                            /* Stop=用户S; Enter=手动/别session; 其余=用户改派 */
+                            char b4[16];
+                            go = 0;
+                            LogParts("  skip retasked passenger: obj=",
+                                     HtoA8((unsigned)pax, b1),
+                                     " mission=", ItoA(mm, b4), NULL);
+                        }
+                    }
+                    if (!go)
+                    {
+                        s->laneNext[L]++;
+                        s->laneStall[L] = 0;
+                    }
+                    else
+                    {
                     if (activeDead)
                         LOGS("  lane advance: active dead");
-                    else if (stallOut && occNow <= s->laneGate[L])
+                    else if (stallOut && !occRisen)
                         LOGS("  lane advance: stall timeout");
                     if (IssuePlanned(pax, s->laneTrn[L], s->laneNext[L],
                                      s->laneSame[L][s->laneNext[L]],
@@ -2009,7 +2142,9 @@ static void SessionTickOne(ALSession* s, int idx)
                         s->laneStall[L] = 0;
                     }
                     /* 入队失败 (OutList 满): 不推进, 下帧重试 */
+                    }
                 }
+            }
             }
         }
     }
@@ -2018,7 +2153,7 @@ static void SessionTickOne(ALSession* s, int idx)
         if (s->laneNext[L] < s->laneN[L] ||
             s->laneMoveNext[L] < s->laneN[L]) { allDone = 0; break; }
     if (allDone)
-        SessionEnd(s, idx, "all released");
+        SessionEnd(s, idx, s->sessReleased > 0 ? "all released" : "aborted/empty");
 }
 
 /* 每帧推进所有活跃 session (各管各的车道, 互不覆盖)。 */
