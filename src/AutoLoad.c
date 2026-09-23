@@ -19,10 +19,11 @@
  *       多人并行不抢槽), 载具每上一个人 (occ 上涨) 下一个才转 Enter —— 同一时刻
  *       最多一个未上车的 Enter 持有者, 槽交接无竞争, 上车顺序=距离序, 总耗时≈
  *       最远行军+ N×轮询。现任死亡/任务丢失/超时 300 帧无进展则越过。
- *       用户接管优先: 现任被 S(Stop)/改派且无上车进展则整车道丢弃;
- *       待发成员被 S/改派/另有 Enter 在身则跳过 (Guard 且距车 10 格外
- *       视为半路被停), 不再复活用户停掉的单位。
- *       Stagger=0 回到 legacy 行为 (同帧全下发, 顺序随机)。
+ *       用户接管优先 (认任务号+认方向, 不认按键): 现任拿住 Enter 后被
+ *       S/G/改派且无上车进展则整车道丢弃, X 散开/鼠标拉走 (越跑越远) 同样
+ *       丢弃; 待发成员被接管则跳过 (Guard 且距车 10 格外视为半路被停),
+ *       不再复活用户拿走的单位。
+ *       默认关闭分波 (Stagger=0: 同帧全下发, 顺序随机); 置 Stagger=1 启用。
  *
  * 功能2 变体选择: IFV逻辑载具 (FV/AMC/TRACTOR/STING 等 Gunner=yes) 随载员不同
  *       使用 Weapon1/Weapon2/... 中的不同实际武器, 但原生T键按注册名全选会把
@@ -160,6 +161,8 @@ void* memset(void* s, int c, unsigned n)
 #define RANGE_LEPTONS   (30 * 256)  /* "附近"半径: 30 格 (与任一选中乘客的平面距离) */
 #define NEAR_LEPTONS    (10 * 256)  /* "到位"半径: 距车 10 格内且 Guard=到位待命,
                                        之外且 Guard=半路被用户停掉 (或车开走跟丢) */
+#define AWAY_LEPTONS    (6 * 256)   /* "跑远"容差: 行军只会越走越近, 当前距离平方
+                                       超过规划值该量即 X 散开/手动拉走 */
 
 /* Session watchdog: a normal session ends in dozens of frames;
  * SESS_MAX_FRAMES is a pure backstop. Boarding latency itself comes
@@ -322,9 +325,9 @@ static unsigned int  g_vVkKey = 'T';
 static unsigned int  g_vMods = HKMOD_CONTROL;
 static int           g_vDisabled = 0;
 static char          g_vDesc[24] = "Ctrl+T";
-/* Stagger=1 (default): plan once, release waves gated on boarding. */
+/* Stagger=1: plan once, release waves gated on boarding (default 0 = legacy). */
 /* Stagger=0: legacy single-frame dispatch (boarding order random). */
-static int           g_stagger = 1;
+static int           g_stagger = 0;
 
 static int ChrLower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
@@ -406,16 +409,15 @@ static void BuildVariantDesc(void)
 }
 
 static void ParseHotkeyInto(const char* spec, const char* fallbackDesc,
-                            unsigned int fallbackVk, unsigned int fallbackMods,
-                            unsigned int* outVk, unsigned int* outMods,
-                            int* outDisabled, char* outDesc,
-                            void (*buildDesc)(void))
+                             unsigned int fallbackVk, unsigned int fallbackMods,
+                             unsigned int* outVk, unsigned int* outMods,
+                             int* outDisabled,
+                             void (*buildDesc)(void))
 {
     char toks[8][16];
     int ntok = 0, i;
     unsigned int mods = 0, key = 0;
     const char* p = spec;
-    (void)outDesc; /* 描述由 buildDesc 回调统一生成, 此处仅解析键值 */
 
     if (StrEqNI(spec, "None") || StrEqNI(spec, "Off") || StrEqNI(spec, "Disabled"))
     {
@@ -462,23 +464,27 @@ static void ParseHotkeyInto(const char* spec, const char* fallbackDesc,
 static void ParseHotkey(const char* spec)
 {
     ParseHotkeyInto(spec, "Ctrl+D", 'D', HKMOD_CONTROL,
-                    &g_vkKey, &g_mods, &g_hotkeyDisabled, g_hotkeyDesc,
+                    &g_vkKey, &g_mods, &g_hotkeyDisabled,
                     BuildHotkeyDesc);
 }
 
 static void ParseVariantHotkey(const char* spec)
 {
     ParseHotkeyInto(spec, "Ctrl+T", 'T', HKMOD_CONTROL,
-                    &g_vVkKey, &g_vMods, &g_vDisabled, g_vDesc,
+                    &g_vVkKey, &g_vMods, &g_vDisabled,
                     BuildVariantDesc);
 }
 
-/* 读 DLL 同目录的 AutoLoad.ini; 文件/键缺失时 GetPrivateProfileString 返回默认值 */
+/* 读 DLL 同目录的 AutoLoad.ini; 文件/键缺失时 GetPrivateProfileString 返回默认值。
+ * 只读一次 (handshake 与首帧各调一次, 内容幂等, 日志去重)。 */
 static void ReadConfig(void)
 {
     char path[MAX_PATH], buf[64];
     DWORD n;
+    static int done = 0;
+    if (done) return;
     if (!g_hSelf) return;
+    done = 1;
     n = GetModuleFileNameA(g_hSelf, path, MAX_PATH);
     if (!n || n >= MAX_PATH - 16) return;
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
@@ -492,8 +498,8 @@ static void ReadConfig(void)
     ParseVariantHotkey(buf);
     LogParts("config: variant hotkey = ", g_vDesc,
              " (from AutoLoad.ini [AutoLoad] VariantHotkey)", NULL);
-    GetPrivateProfileStringA("AutoLoad", "Stagger", "1", buf, sizeof(buf), path);
-    g_stagger = (buf[0] == '0' && buf[1] == 0) ? 0 : 1;
+    GetPrivateProfileStringA("AutoLoad", "Stagger", "0", buf, sizeof(buf), path);
+    g_stagger = (buf[0] == '1' && buf[1] == 0) ? 1 : 0;
     LOG2("config: stagger = ", g_stagger ? "1" : "0 (legacy dispatch)");
 }
 
@@ -572,7 +578,7 @@ static void EnsurePollThread(void)
 /* ---------------- 核心: 均衡分配并下发指令 ---------------- */
 
 typedef struct { void* obj; unsigned int type; int cost; int isInf; } PItem;
-typedef struct { void* obj; unsigned int type; int freeSlots; int assigned; double sizeLimit; } TItem;
+typedef struct { void* obj; int freeSlots; int assigned; double sizeLimit; } TItem;
 
 static long long Dist2Leptons(const void* a, const void* b)
 {
@@ -767,9 +773,6 @@ static void PruneReleased(void)
     g_relCount = w;
 }
 
-/* 引擎 PassengersClass::GetTotalSize 的前向声明 (定义在后, 诊断快照先用) */
-static int GetUsedSlots(void* trn);
-
 /* Intra-group proximity swap: keep the spread COUNTS from step 5
  * (evenness first: 1+4 stays 1+4), but move members onto the carrier
  * standing next to them. Kills "position swap" runs (both sides lined up
@@ -902,15 +905,15 @@ static int PaxCostOf(void* pax)
 /* 其它进行中 session 已预定但尚未体现为 used 的槽位 (防同车并发超发):
  * 对同一 transport, 累加各 session 车道里尚未释放的剩余成员 cost
  * (含现任持有者, 保守多算一个, 宁可欠发不少超发; 已上车后 used 上涨,
- * 剩余同步收缩, 短暂双算可接受)。规划新 session 时调用, exclude<0 表全部。 */
-static int ReservedForTransport(const void* trn, int excludeIdx)
+ * 剩余同步收缩, 短暂双算可接受)。规划新 session 时调用 (新 session 尚未
+ * active, 在场全是别人的, 无需排除项)。 */
+static int ReservedForTransport(const void* trn)
 {
     int i, L, k, sum = 0;
     if (!trn) return 0;
     for (i = 0; i < MAX_SESSIONS; i++)
     {
         ALSession* s;
-        if (i == excludeIdx) continue;
         s = &g_sess[i];
         if (!s->active) continue;
         for (L = 0; L < s->nlanes; L++)
@@ -1414,7 +1417,7 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
              * 不同地点 (不同载具) 时 reserved=0, 互不影响。 */
             freeSlots = cap - used - PassAssigned(obj);
             if (forPlan)
-                freeSlots -= ReservedForTransport(obj, -1);
+                freeSlots -= ReservedForTransport(obj);
             LogParts("  transport: obj=", HtoA8((unsigned)obj, b1),
                      " type=", HtoA8(typePtr, b2), NULL);
             LogParts("    capacity=", ItoA(cap, b1), " usedSlots=", ItoA(used, b2),
@@ -1423,7 +1426,6 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
             if (freeSlots > 0)
             {
                 ts[nt].obj = obj;
-                ts[nt].type = typePtr;
                 ts[nt].freeSlots = freeSlots;
                 ts[nt].assigned = 0;
                 ts[nt].sizeLimit = szLimit;
@@ -1886,6 +1888,17 @@ static void TransportCell(const void* trn, int* cx, int* cy)
     *cy = lc[1] >> 8;
 }
 
+/* 是否越跑越远 (X 散开/手动拉走): 当前距离平方 > 规划距离平方 + 容差。
+ * planDist 为 laneDist 条目 (bestDist>>8 尺度); 车在开时距离整体漂移, 不判。 */
+static int MovedAway(const void* pax, const void* trn, int planDist, int trnMoving)
+{
+    long long now;
+    if (trnMoving) return 0;
+    now = Dist2Leptons(pax, trn);
+    return (now > ((long long)planDist << 8) +
+            (long long)AWAY_LEPTONS * AWAY_LEPTONS);
+}
+
 /* 补发行军队所有待发 Move (失败即停, 下 tick 重试)。
  * isStart=1 (建道当刻): 初始命令无条件发 —— 用户刚按了热键就是要装。
  * isStart=0 (后续 tick 补发): 尊重用户接管, Stop(用户S)/已拿 Enter
@@ -1938,9 +1951,7 @@ static void StartSessionFromSnapshot(int isReplace, void** snapItems, int snapCo
     int idx;
     ALSession* s;
     char b1[16], b2[16], b3[16];
-    g_passActive = 0;
-    g_doneCount = 0;
-    g_asgCount = 0;
+    EndPass(); /* 清本轮预算/去重表 (与 legacy 同语义, stagger 只借其清零) */
     ClearTypeAsg();
     g_planCount = 0;
     if (!isReplace && g_relCount > 0)
@@ -1965,7 +1976,6 @@ static void StartSessionFromSnapshot(int isReplace, void** snapItems, int snapCo
         return;
     }
     s = &g_sess[idx];
-    s->active = 0;
     s->sessFrame = 0;
     s->sessReleased = 0;
     s->nlanes = 0;
@@ -2056,19 +2066,30 @@ static void SessionTickOne(ALSession* s, int idx)
                 if (mAct == MISSION_ENTER)
                     s->laneEverEnter[L] = 1;
             }
-            /* 用户接管现任 (且无上车进展) 则整车道丢弃。Stop 一定是用户 S;
-             * 拿住 Enter 后的 Guard/AreaGuard 在单持槽流程里也只可能是用户 S
-             * (链路独占下现任恒持槽, 引擎对非持槽等待者只改派 Move) —— 唯一的
-             * 例外是载具自己在开, 此时追车的合法等待, 不误杀。其它杂项任务号
-             * 更是用户改派无疑。别逐个复活用户停掉的。 */
+            /* 用户接管现任 (且无上车进展) 则整车道丢弃:
+             * Stop 必是用户; 拿住 Enter 后的 Guard/AreaGuard 在单持槽下也只
+             * 可能是用户 S (现任恒持槽, 引擎只对非持槽等待者改派 Move),
+             * 载具自己在开时追车等待除外; 拿住后变 Move 且越跑越远
+             * (X 散开/鼠标拉走) 也是用户, 用规划距离+6 格作越界线
+             * (行军队只会越走越近)。别逐个复活用户拿走的。 */
             int trnMoving =
                 (*(int*)((char*)s->laneTrn[L] + OFF_TECHNO_MISSION) == MISSION_MOVE);
-            if (s->laneNext[L] > 0 && !occRisen && !activeDead && mAct != -999 &&
-                (mAct == MISSION_STOP ||
-                 (s->laneEverEnter[L] && mAct != MISSION_ENTER &&
-                  mAct != MISSION_MOVE &&
-                  ((mAct != MISSION_GUARD && mAct != MISSION_AREA_GUARD) ||
-                   !trnMoving))))
+            int tookActive = 0;
+            if (mAct == MISSION_STOP)
+                tookActive = 1;
+            else if (s->laneEverEnter[L] && mAct != -999 &&
+                     mAct != MISSION_ENTER)
+            {
+                if (mAct == MISSION_MOVE)
+                    tookActive = MovedAway(s->laneActive[L], s->laneTrn[L],
+                                           s->laneDist[L][s->laneNext[L] - 1],
+                                           trnMoving);
+                else if (mAct == MISSION_GUARD || mAct == MISSION_AREA_GUARD)
+                    tookActive = !trnMoving;
+                else
+                    tookActive = 1;
+            }
+            if (s->laneNext[L] > 0 && !occRisen && !activeDead && tookActive)
             {
                 char b4[16];
                 LogParts("  lane aborted: active taken over (user stop?) unit=",
@@ -2098,7 +2119,20 @@ static void SessionTickOne(ALSession* s, int idx)
                     {
                         int mm = *(int*)((char*)pax + OFF_TECHNO_MISSION);
                         if (mm == MISSION_MOVE)
-                            go = 1; /* 我们的行军/引擎改派靠站, 正常 */
+                        {
+                            /* 我们的行军 (越走越近) vs X 散开/鼠标拉走
+                             * (越走越远): 规划距离+6 格越界即后者, 跳过。
+                             * 车在开时距离漂移, 不判。 */
+                            if (MovedAway(pax, s->laneTrn[L],
+                                          s->laneDist[L][s->laneNext[L]],
+                                          trnMoving))
+                            {
+                                go = 0;
+                                LogParts("  skip moved-away passenger (X scatter/manual?): obj=",
+                                         HtoA8((unsigned)pax, b1), NULL, NULL);
+                            }
+                            else go = 1;
+                        }
                         else if (mm == MISSION_GUARD || mm == MISSION_AREA_GUARD)
                         {
                             /* 到位待命 vs 半路被 S: 距车 10 格内算前者,
