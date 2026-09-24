@@ -2005,6 +2005,7 @@ static void StartSessionFromSnapshot(int isReplace, void** snapItems, int snapCo
             released0++;
             s->laneNext[L] = 1;
             s->laneActive[L] = s->lanePax[L][0];
+            s->laneEverEnter[L] = 0; /* everEnter 属于当前现任, 新任重新观察 */
             s->laneGate[L] = GetUsedSlots(s->laneTrn[L]);
             s->laneStall[L] = 0;
         }
@@ -2171,6 +2172,7 @@ static void SessionTickOne(ALSession* s, int idx)
                         MarkReleased(pax);
                         s->sessReleased++;
                         s->laneActive[L] = pax;
+                        s->laneEverEnter[L] = 0; /* everEnter 属于当前现任, 新任重新观察 */
                         s->laneNext[L]++;
                         s->laneGate[L] = occNow;
                         s->laneStall[L] = 0;
