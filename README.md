@@ -1,5 +1,6 @@
 # 心灵终结自动装车扩展
 Mental Omega Unit automatic vehicle loading extension.  
+让单位(步兵，车辆)快速寻找适当的载具并进入。  
 该扩展旨在解决《心灵终结》中繁琐乏味的装车环节。这在大大的减少了玩家操作同时，也做到了不影响联机PVE功能。
 
 ![alt text](other/exp.gif)
@@ -26,7 +27,7 @@ Mental Omega Unit automatic vehicle loading extension.
 ![alt text](other/例子/不等人.gif)
 
 ### 自定义快捷键：
-更改 `AutoLoad.ini` 文件，在缺失和默认情况下使用 CTRL + D。
+更改 `AutoLoad.ini` 文件，在缺失和默认情况下使用 CTRL + D。  
 通过 Hotkey 更改快捷键，例如`Hotkey=Alt+D`
  
 ### 装载过滤：
@@ -44,7 +45,7 @@ Mental Omega Unit automatic vehicle loading extension.
 编译环境使用`mingw-i686`  
 推荐在项目内放置项目 [phobos](https://github.com/Phobos-developers/Phobos),
 [yrpp](https://github.com/Ares-Developers/YRpp)，
-和 rulesmo.ini 单位名称等文件以供AI参考。
+和 rulesmo.ini 单位名称、ini词典 等文件以供AI参考。
 
 ## 在 cncnet 版 ra2 中使用：  
 用 `例子\Resources\ClientDefinitions.ini` 替换 `Resources\ClientDefinitions.ini` 文件.  

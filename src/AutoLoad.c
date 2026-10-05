@@ -11,8 +11,9 @@
  *       (超员时远处的落选, 而不是选中顺序/地图从上到下在前者先得)。
  *       只处理选中单位; 装不下的
  *       多余单位不做处理。飞行运动模式的单位 (火箭飞行兵等) 自动跳过;
- *       NoManualUnload=yes 的载具 (清道夫 TRACTOR 等) 不可被进入, 仅作为运输方
- *       被跳过 —— 它本身仍可作为乘客进入 LCRF/SAPC 等正常运输载具; 容量与装载
+ *       NoManualUnload=yes / NoManualEnter=yes 的载具 (清道夫 TRACTOR /
+ *       监狱车 RAVA/CHRP 等) 不可被手动进入, 仅作为运输方被跳过 —— 它本身
+ *       仍可作为乘客进入 LCRF/SAPC 等正常运输载具; 容量与装载
  *       等级按引擎原生判据 (Size 之和 / SizeLimit) 严格记账; 支持 载具->运输载具。
  *       分波放行: 分配一次算完。先走后进 (HANDBOOK §10): 首波最近者直接拿
  *       Enter (空槽直链, 第一个上), 其余先 Move 行军到载具附近 (Move 不进链,
@@ -101,8 +102,13 @@ void* memset(void* s, int c, unsigned n)
 #define OFF_TTYPE_ARES_EXT    0x2FC  /* Ares: TechnoTypeExt::ExtData 指针
                                          (Ares 类型构造钩子写入; 仅 ares.dll 已加载时可信) */
 #define OFF_ARES_EXT_NMU      0x4C5  /* Ares ExtData::NoManualUnload (byte; Ares 读取点
-                                         0x10049E70: type+0x2FC -> +0x4C5 判定, 三份
-                                         游戏目录的 Ares.dll 二进制一致) */
+                                          0x10049E70: type+0x2FC -> +0x4C5 判定, 三份
+                                          游戏目录的 Ares.dll 二进制一致)
+                                          相邻: +0x4C6=NoManualFire, +0x4C7=NoManualEnter,
+                                          +0x4C8=NoSelfGuardArea (Body.h/Body.cpp 声明与
+                                          Serialize 顺序一致, Valueable<bool>=1字节) */
+#define OFF_ARES_EXT_NME      0x4C7  /* Ares ExtData::NoManualEnter (byte; 目标载具不可被
+                                          手动进入, hook 0x74031A/0x51ED8E 只查目标方) */
 #define ADDR_GET_TOTAL_SIZE   0x00473460u /* PassengersClass::GetTotalSize (thiscall) 已占槽数 */
 #define ADDR_CHECK_TYPESELECT 0x00732580u /* (thiscall, ecx=object) T选择用的归属/可选中判定, 返回AL */
 #define ADDR_CHECK_ALIVE      0x007342C0u /* (ecx=object) [obj+0x14]&1, 返回AL (同屏候选先过此关) */
@@ -951,14 +957,16 @@ static int EnqueuePending(void** items, int count)
     return -1;
 }
 
-/* Ares NoManualUnload 过滤 (仅用于运输方):
+/* Ares NoManualUnload / NoManualEnter 过滤 (仅用于运输方):
  * TechnoType+0x2FC 存 Ares TechnoTypeExt::ExtData 指针 (Ares 类型构造钩子写入),
- * ExtData+0x4C5 = NoManualUnload (byte)。此类载具 (清道夫 TRACTOR 等) 不可被
- * 进入、内部载员也不可手动卸载 —— 只在收集运输方时跳过, 它自己作为乘客进入
- * LCRF/SAPC 等正常运输载具不受影响 (Ares 光标判定 0x10049E70 也只查目标载具)。
- * ares.dll 未加载时该偏移是普通引擎数据不可信, 直接不过滤 (此时也不存在该规则
- * 标志)。 */
-static int IsNoManualUnloadType(unsigned int typePtr)
+ * ExtData+0x4C5 = NoManualUnload (byte), +0x4C7 = NoManualEnter (byte)。
+ * NoManualUnload 载具 (清道夫 TRACTOR 等) 内部载员不可手动卸载;
+ * NoManualEnter 载具 (RAVA/CHRP 等监狱车) 不可被手动进入 (Ares 光标判定
+ * 0x74031A/0x51ED8E 只查目标载具: Passengers>0 && !NoManualEnter)。
+ * 两者都只在收集运输方时跳过, 它自己作为乘客进入 LCRF/SAPC 等正常运输载具
+ * 不受影响。ares.dll 未加载时该偏移是普通引擎数据不可信, 直接不过滤
+ * (此时也不存在该规则标志)。 */
+static int IsAresExtFlag(unsigned int typePtr, unsigned int off)
 {
     unsigned int ext;
     HMODULE h;
@@ -967,7 +975,17 @@ static int IsNoManualUnloadType(unsigned int typePtr)
     if (!h) return 0;
     ext = *(unsigned int*)(typePtr + OFF_TTYPE_ARES_EXT);
     if (!ext) return 0;
-    return *(unsigned char*)(ext + OFF_ARES_EXT_NMU) != 0;
+    return *(unsigned char*)(ext + off) != 0;
+}
+
+static int IsNoManualUnloadType(unsigned int typePtr)
+{
+    return IsAresExtFlag(typePtr, OFF_ARES_EXT_NMU);
+}
+
+static int IsNoManualEnterType(unsigned int typePtr)
+{
+    return IsAresExtFlag(typePtr, OFF_ARES_EXT_NME);
 }
 
 /* 飞行运动模式判定: 读类型上的 Locomotor GUID (TechnoType+0x34C) */
@@ -1294,7 +1312,7 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
     int np = 0, nt = 0, i, j;
     int events = 0;
     int remaining = 0;
-    int nInfSeen = 0, nTrnSeen = 0, nFlySeen = 0, nVehSeen = 0, nNmuSeen = 0;
+    int nInfSeen = 0, nTrnSeen = 0, nFlySeen = 0, nVehSeen = 0, nNmuSeen = 0, nNmeSeen = 0;
     int nRelSeen = 0;
     int queueFull = 0;
     /* 快照模式 (Stagger 新 session): 用按下瞬间拷贝的选中, 不读实时选中,
@@ -1395,7 +1413,14 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
         if (IsNoManualUnloadType(typePtr))
         {
             nNmuSeen++;
-            LogParts("  transport NoManualUnload (internal cargo, not enterable): obj=",
+            LogParts("  transport NoManualUnload (internal cargo): obj=",
+                     HtoA8((unsigned)obj, b1), " type=", HtoA8(typePtr, b2), NULL);
+            continue;
+        }
+        if (IsNoManualEnterType(typePtr))
+        {
+            nNmeSeen++;
+            LogParts("  transport NoManualEnter (not enterable): obj=",
                      HtoA8((unsigned)obj, b1), " type=", HtoA8(typePtr, b2), NULL);
             continue;
         }
@@ -1441,7 +1466,8 @@ static void DoAutoLoad(int forPlan, void** snapItems, int snapCount)
     LogParts("auto-load: selected count=", ItoA(count, b1),
              " infantry=", ItoA(nInfSeen, b2), " techno=", ItoA(nTrnSeen, b3),
              " flyingSkipped=", ItoA(nFlySeen, b4), NULL);
-    LogParts("noManualUnloadSkipped=", ItoA(nNmuSeen, b1), NULL, NULL);
+    LogParts("noManualUnloadSkipped=", ItoA(nNmuSeen, b1),
+             " noManualEnterSkipped=", ItoA(nNmeSeen, b2), NULL, NULL);
     LogParts("usable: passengers=", ItoA(np, b1),
              " (inf=", ItoA(nInfSeen, b2), " veh=", ItoA(nVehSeen, b3),
              ") transports with free slots=", ItoA(nt, b4), NULL);

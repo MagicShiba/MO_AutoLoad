@@ -58,7 +58,7 @@
 | 全图候选 | Techno Array Items `0xA8EC7C`，Count `0xA8EC88` |
 | IFV 变体 | 类型 `Gunner+0x805`（byte）、`WeaponCount+0x80C`、ID 字符串 `+0x24`（仅日志）；对象当前武器序号 `[obj+0x138]` |
 | 武器解析 | **必须调 accessor `0x7177C0`**（`ecx=类型, idx` 入栈，返回 WeaponStruct*，+0 即实际武器指针）。Ares 接管了 18+ 槽位存储，直接按 `type+0x898+idx*0x1C` 计算只对 `idx<18` 有效，更大会读到垃圾并分出幻影组。该 accessor 只给普通武器，天然忽略 Elite（符合需求） |
-| Ares NoManualUnload | `ares.dll` 在才可信：`ext=*(type+0x2FC)`，`NoManualUnload=*(byte)(ext+0x4C5)`（Ares 读取点 `0x10049E70`；若 Ares 升级先复查此式） |
+| Ares NoManualUnload / NoManualEnter | `ares.dll` 在才可信：`ext=*(type+0x2FC)`，`NoManualUnload=*(byte)(ext+0x4C5)`、`NoManualEnter=*(byte)(ext+0x4C7)`（中间隔 `0x4C6=NoManualFire`；Ares 读取点 `0x10049E70` / 光标判定 `0x74031A`；若 Ares 升级先复查此式） |
 
 ## 4. 装载算法（最终规则）
 
@@ -112,8 +112,10 @@
 - **飞行**：按**类型**上的 Locomotor GUID（`[type+0x34C]`，16 字节）判定，
   命中 Rocket（全部 MO 飞行步兵）或 Jumpjet（兼容原版）即跳过。
   不要用运行时运动器虚表（实测不可靠）。
-- **NoManualUnload**（清道夫 TRACTOR 等）：**只在收集运输方时跳过**
-  （不可被进入），它自己仍可当乘客进运输船（规则只约束被进入/卸载）。
+- **NoManualUnload / NoManualEnter**（清道夫 TRACTOR / 监狱车 RAVA·CHRP 等）：
+  **只在收集运输方时跳过**（不可被手动进入），它自己仍可当乘客进运输船
+  （规则只约束被进入/卸载）。`NoManualEnter=yes` 单独出现的类型（RAVA/CHRP）
+  同样被跳过。
 - **载具乘客**：只进 Unit 型运输载具（不进建筑/飞行器）；本轮已当运输工具
   的载具不再当乘客。
 
