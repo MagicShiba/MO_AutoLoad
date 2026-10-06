@@ -6,8 +6,8 @@ Mental Omega Unit automatic vehicle loading extension.
 ![alt text](other/exp.gif)
 
 快捷键为：
-- **CTRL + D** 选中单位和载具，触发自动装载。  
-- **CTRL + T** 按同类型武器选择，便于筛选清道夫，ifv等。 
+- **CTRL + D** : 选中单位和载具，触发自动装载。  
+- **CTRL + T** : 按同类型武器选择，便于筛选清道夫，ifv等。 
 
 ## 使用方法：
 将 **AutoLoad_nolog.dll**  放在**游戏根目录**内。例如:  
@@ -35,17 +35,32 @@ Mental Omega Unit automatic vehicle loading extension.
 清道夫这类禁止卸载单位的单位，也需要过滤掉以免被其它单位装入和同类互相装载。
 
 ## 开源与插件制作
-在“源码与探索”文件夹已提供源码与文档。  
-你可以轻松的让AI分析插件做法，和配置环境。   
+你可以轻松的让AI分析插件做法，和配置环境。  
+即使在发布文件的“源码与探索”文件夹中也提供了源码与文档。  
+
+### 插件制作简要说明：
+1. 下载一个AI编程工具。
+2. 自己复制一份游戏，只是避免造成无法挽回的损坏。
+3. 克隆本仓库作例子或自己准备文件夹都行。
+4. 让AI准备编译环境和需要的参考文件，可让AI参考本项目AI写的文档。
+5. 让AI参考已有资料和做法去做插件
+6. 许愿
 
 使用的模型：  
 早期 GLM 5.3  
 复杂功能和算法由 muse spark 1.3 实现
 
-编译环境使用`mingw-i686`  
+编译环境使用：`mingw-i686`  
 推荐在项目内放置项目 [phobos](https://github.com/Phobos-developers/Phobos),
-[yrpp](https://github.com/Ares-Developers/YRpp)，
+[YRpp](https://github.com/Ares-Developers/YRpp)，
 和 rulesmo.ini 单位名称、ini词典 等文件以供AI参考。
+
+实际项目结构中还包含:  
+tools : 放置mingw-i686编译环境  
+references : 放置参考项目 phobos YRpp  
+ini : 放置ini,txt格式csf,ares说明书,代码词典  
+
+
 
 ## 在 cncnet 版 ra2 中使用：  
 用 `例子\Resources\ClientDefinitions.ini` 替换 `Resources\ClientDefinitions.ini` 文件.  
