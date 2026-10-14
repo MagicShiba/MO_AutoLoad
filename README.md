@@ -71,3 +71,7 @@ ini : 放置ini,txt格式csf,ares说明书,代码词典
 插件依赖ares的注射器加载dll逻辑，需要有注射器，ifv武器筛选和装载过滤依赖于ares，你可能需要手动放ares和注射器让其它版本支持。  
 在注射器自动加载dll时，只需要在根目录放置dll即可使用。  
 在启动时使用白名单指定dll时，需要手动添加当前dll路径。  
+
+## 相关项目
+[红警2字体编辑器](https://github.com/MagicShiba/Ra2FontEditor)  
+[心灵终结体验优化扩展](https://github.com/MagicShiba/MO_ExperienceEnhancements)
