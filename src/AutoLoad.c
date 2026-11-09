@@ -123,6 +123,10 @@ void* memset(void* s, int c, unsigned n)
 #define OFF_TACTICAL_CNT      0xDB0     /* [Tactical+0xDB0] = 同屏可选数量 (0x6DC420 确认) */
 #define OFF_TACTICAL_ARRAY    0xB0CEC8u /* TacticalSelectables[500], 每项12字节, +0=Object* */
 #define SZ_TACTICAL_ENTRY     12
+#define MAX_TACTICAL_COUNT    4096
+#define MOE_SELPOOL_EXPORT    "MOE_QuerySelPool"
+
+typedef int (__cdecl *Fn_MOE_QuerySelPool)(unsigned int* base, unsigned int* capacity);
 
 /* IFV 变体判定偏移 (全部逆向确认):
  * Gunner@0x805 (INI解析0x714A50确认), WeaponCount@0x80C
@@ -1167,6 +1171,25 @@ static void HistNote(unsigned int* hT, unsigned int* hW, int* hC, int* hN,
     }
 }
 
+static int QueryMOESelPool(unsigned int* base, unsigned int* capacity)
+{
+    HMODULE moe = GetModuleHandleA("MOExperience.dll");
+    Fn_MOE_QuerySelPool query;
+    unsigned int b = 0, n = 0;
+    if (!moe) return 0;
+    {
+        FARPROC proc = GetProcAddress(moe, MOE_SELPOOL_EXPORT);
+        if (!proc) return 0;
+        query = (Fn_MOE_QuerySelPool)(void*)proc;
+    }
+    if (!query(&b, &n)) return 0;
+    if (b < 0x10000u || b >= 0x80000000u || n <= 500u || n > MAX_TACTICAL_COUNT)
+        return 0;
+    *base = b;
+    *capacity = n;
+    return 1;
+}
+
 static void DoVariantSelect(int wholeMap)
 {
     void** selItems = *(void***)OFF_SELECTION_ITEMS;
@@ -1238,12 +1261,18 @@ static void DoVariantSelect(int wholeMap)
     else
     {
         unsigned int tac = *(unsigned int*)OFF_TACTICAL_INST;
+        unsigned int tableBase = OFF_TACTICAL_ARRAY;
+        unsigned int tableCap = 500u;
         int count;
         if (!tac) return;
         count = *(int*)(tac + OFF_TACTICAL_CNT);
+        if (count < 0) return;
+        if (!QueryMOESelPool(&tableBase, &tableCap) && count > 500)
+            count = 500;
+        if ((unsigned)count > tableCap) count = (int)tableCap;
         for (i = 0; i < count; i++)
         {
-            void* obj = *(void**)(OFF_TACTICAL_ARRAY + (unsigned)i * SZ_TACTICAL_ENTRY);
+            void* obj = *(void**)(tableBase + (unsigned)i * SZ_TACTICAL_ENTRY);
             VKey k;
             if (!obj) continue;
             scanned++;
